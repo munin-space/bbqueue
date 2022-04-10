@@ -283,6 +283,19 @@ impl<const A: usize> BBBuffer<A> {
 
 impl<'s, const A: usize> BBBuffer<A> {
     /// Try to recover the contents of an existing BBBuffer
+    /// before it is initialized.
+    ///
+    /// This is useful in situations where the buffer survives a soft restart
+    /// (e.g. a panic) and we want to get the data that was stored (e.g. logs).
+    ///
+    /// Returns an `Option` with a tuple containing:
+    /// * The state of the read/write offsets as: `[write, read, last, reserve]` (probably a struct in the future)
+    /// * The first readable slice
+    /// * The second readable slice
+    ///
+    /// If there is nothing to recover, the function returns `None`. This can be because:
+    /// * The offsets make sense and there was nothing to be read in the buffer
+    /// * The offsets don't make sense (i.e. they fall out of the allocated BBBuffer)
     pub unsafe fn recover(
         buf: &mut MaybeUninit<BBBuffer<A>>,
     ) -> Option<([usize; 4], &'s mut [u8], &'s mut [u8])> {
@@ -299,33 +312,40 @@ impl<'s, const A: usize> BBBuffer<A> {
         let write = write_p.read().load(Acquire);
         let mut read = read_p.read().load(Acquire);
         let last = last_p.read().load(Acquire);
-        // If the pointers are in the same place, there's nothing to recover
-        if write == read {
+
+        // The offsets should never be larger than the buffer size
+        if write > A || read > A || last > A {
             return None;
-        } else {
-            let buffer_pointers = [write, read, last, reserve_p.read().load(Acquire)];
-
-            // Resolve the inverted case or end of read
-            if (read == last) && (write < read) {
-                read = 0;
-            }
-
-            let (sz1, sz2) = if write < read {
-                // Inverted, only believe last
-                (last - read, write)
-            } else {
-                // Not inverted, only believe write
-                (write - read, 0)
-            };
-
-            // This is sound, as UnsafeCell, MaybeUninit, and GenericArray
-            // are all `#[repr(Transparent)]
-            let start_of_buf_ptr = buf.as_mut_ptr().cast::<u8>();
-            let slice1 = from_raw_parts_mut(start_of_buf_ptr.offset(read as isize), sz1);
-            let slice2 = from_raw_parts_mut(start_of_buf_ptr, sz2);
-
-            return Some((buffer_pointers, slice1, slice2));
         }
+
+        let buffer_pointers = [write, read, last, reserve_p.read().load(Acquire)];
+
+        // This is basically a copy of the split_read code without handling the
+        // internal pointers (because we don't care anymore)
+        // Resolve the inverted case or end of read
+        if (read == last) && (write < read) {
+            read = 0;
+        }
+
+        let (sz1, sz2) = if write < read {
+            // Inverted, only believe last
+            (last - read, write)
+        } else {
+            // Not inverted, only believe write
+            (write - read, 0)
+        };
+
+        if sz1 == 0 {
+            return None;
+        }
+
+        // This is sound, as UnsafeCell, MaybeUninit, and GenericArray
+        // are all `#[repr(Transparent)]
+        let start_of_buf_ptr = buf.as_mut_ptr().cast::<u8>();
+        let slice1 = from_raw_parts_mut(start_of_buf_ptr.offset(read as isize), sz1);
+        let slice2 = from_raw_parts_mut(start_of_buf_ptr, sz2);
+
+        return Some((buffer_pointers, slice1, slice2));
     }
 }
 /// `Producer` is the primary interface for pushing data into a `BBBuffer`.
