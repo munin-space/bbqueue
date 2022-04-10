@@ -281,6 +281,53 @@ impl<const A: usize> BBBuffer<A> {
     }
 }
 
+impl<'s, const A: usize> BBBuffer<A> {
+    /// Try to recover the contents of an existing BBBuffer
+    pub unsafe fn recover(
+        buf: &mut MaybeUninit<BBBuffer<A>>,
+    ) -> Option<([usize; 4], &'s mut [u8], &'s mut [u8])> {
+        use core::ptr;
+
+        let write_p = ptr::addr_of_mut!((*buf.as_mut_ptr()).write);
+        let read_p = ptr::addr_of_mut!((*buf.as_mut_ptr()).read);
+        let last_p = ptr::addr_of_mut!((*buf.as_mut_ptr()).last);
+        let reserve_p = ptr::addr_of_mut!((*buf.as_mut_ptr()).reserve);
+        let _read_in_progress_p = ptr::addr_of_mut!((*buf.as_mut_ptr()).read_in_progress);
+        let _write_in_progress_p = ptr::addr_of_mut!((*buf.as_mut_ptr()).write_in_progress);
+        let _already_split_p = ptr::addr_of_mut!((*buf.as_mut_ptr()).already_split);
+
+        let write = write_p.read().load(Acquire);
+        let mut read = read_p.read().load(Acquire);
+        let last = last_p.read().load(Acquire);
+        // If the pointers are in the same place, there's nothing to recover
+        if write == read {
+            return None;
+        } else {
+            let buffer_pointers = [write, read, last, reserve_p.read().load(Acquire)];
+
+            // Resolve the inverted case or end of read
+            if (read == last) && (write < read) {
+                read = 0;
+            }
+
+            let (sz1, sz2) = if write < read {
+                // Inverted, only believe last
+                (last - read, write)
+            } else {
+                // Not inverted, only believe write
+                (write - read, 0)
+            };
+
+            // This is sound, as UnsafeCell, MaybeUninit, and GenericArray
+            // are all `#[repr(Transparent)]
+            let start_of_buf_ptr = buf.as_mut_ptr().cast::<u8>();
+            let slice1 = from_raw_parts_mut(start_of_buf_ptr.offset(read as isize), sz1);
+            let slice2 = from_raw_parts_mut(start_of_buf_ptr, sz2);
+
+            return Some((buffer_pointers, slice1, slice2));
+        }
+    }
+}
 /// `Producer` is the primary interface for pushing data into a `BBBuffer`.
 /// There are various methods for obtaining a grant to write to the buffer, with
 /// different potential tradeoffs. As all grants are required to be a contiguous
